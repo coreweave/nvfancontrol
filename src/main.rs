@@ -348,7 +348,6 @@ fn make_options() -> Options {
     opts.optopt("l", "limits",
         "Comma separated lower and upper limits, use 0 to disable,
         default: 20,80", "LOWER,UPPER");
-    opts.optopt("g", "gpu", "GPU to adjust; must be >= 0", "GPU");
     opts.optflag("p", "print-coolers", "Print available GPUs and coolers");
     opts.optflag("f", "force", "Always use the custom curve even if the fan is
                  already spinning in auto mode");
@@ -424,6 +423,62 @@ impl GPUData {
             self.speed[i] = mgr.ctrl.get_fanspeed(gpu, coolers_ref[i]).unwrap();
         }
 
+    }
+}
+
+fn make_gpu_manager(gpu: u32,
+                    force_update: bool,
+                    monitor_only: bool,
+                    limits: Option<(u16, u16)>) -> NVFanManager {
+    let mut fanflicker = None;
+
+    let points: Vec<(u16, u16)> = match find_config_file() {
+        Some(path) => {
+            info!("Loading configuration file: {:?}", path);
+            match config::from_file(path) {
+                Ok(c) => {
+                    fanflicker = c.fanflicker(gpu as usize);
+                    c.points(gpu as usize).to_vec()
+                }
+                Err(e) => {
+                    warn!("{}; using default curve", e);
+                    make_default_curve(0)
+                }
+            }
+        },
+        None => {
+            warn!("No config file found; using default curve");
+            make_default_curve(0)
+        }
+    };
+
+    debug!("Curve points for GPU {}: {:?}", gpu, points);
+
+    let curve = match FanspeedCurve::new(points) {
+        Ok(curve) => curve,
+        Err(msg) => {
+            error!("{}", msg.to_string());
+            process::exit(1);
+        }
+    };
+
+    let fanflickerrange = match fanflicker {
+        Some(range) => match FanFlickerRange::new(range, &curve, &limits) {
+            Ok(range) => Some(range),
+            Err(e) => {
+                error!("{}", e);
+                process::exit(1);
+            },
+        }
+        None => None,
+    };
+
+    match NVFanManager::new(gpu, curve, force_update, monitor_only, limits, fanflickerrange) {
+        Ok(m) => m,
+        Err(s) => {
+            error!("{}", s);
+            process::exit(1);
+        }
     }
 }
 
@@ -589,27 +644,6 @@ pub fn main() {
         Some((20, 80))
     );
 
-
-    let gpu = matches.opt_process_or_default(
-        "g",
-        |arg: &str| {
-            match arg.parse::<u32>() {
-                Ok(v) => {
-                    validate_gpu_id(v).unwrap_or_else(|e| {
-                        error!("{}", e);
-                        process::exit(1);
-                    });
-                    v
-                },
-                Err(e) => {
-                    error!("Option \"-g\" present but non-valid: \"{}\": {}", e, arg);
-                    process::exit(1);
-                }
-            }
-        },
-        0
-    );
-
     match register_signal_handlers() {
         Ok(_) => {},
         Err(e) => {
@@ -618,37 +652,7 @@ pub fn main() {
         }
     }
 
-    let mut fanflicker = None;
-
-    let points: Vec<(u16, u16)> = match find_config_file() {
-        Some(path) => {
-            info!("Loading configuration file: {:?}", path);
-            match config::from_file(path) {
-                Ok(c) => {
-                    fanflicker = c.fanflicker(gpu as usize);
-                    c.points(gpu as usize).to_vec()
-                }
-                Err(e) => {
-                    warn!("{}; using default curve", e);
-                    make_default_curve(gpu)
-                }
-            }
-        },
-        None => {
-            warn!("No config file found; using default curve");
-            make_default_curve(gpu)
-        }
-    };
-
-    debug!("Curve points: {:?}", points);
-
-    let curve = match FanspeedCurve::new(points) {
-        Ok(curve) => curve,
-        Err(msg) => {
-            error!("{}", msg.to_string());
-            process::exit(1);
-        }
-    };
+    let monitor_only = matches.opt_present("m");
 
     let fanflicker = matches.opt_process_or_default(
         "r",
@@ -662,37 +666,36 @@ pub fn main() {
             }
         },
         // from the config file, overridden by the commandline if present
-        fanflicker
+        match find_config_file() {
+            Some(path) => {
+                info!("Loading configuration file: {:?}", path);
+                match config::from_file(path) {
+                    Ok(c) => c.fanflicker(0 as usize),
+                    Err(e) => None
+                }
+            },
+            None => None
+        }
     );
 
-    let fanflickerrange = match fanflicker {
-        Some(range) => match FanFlickerRange::new(range, &curve, &limits) {
-            Ok(range) => Some(range),
-            Err(e) => {
-                error!("{}", e);
-                process::exit(1);
-            },
-        }
-        None => None,
-    };
+    let ctrl = NvidiaControl::new(None).unwrap();
+    let gpu_count = ctrl.gpu_count().unwrap();
 
-    let monitor_only = matches.opt_present("m");
+    info!("NVIDIA driver version: {}", ctrl.get_version().unwrap());
 
-    let mut mgr = match NVFanManager::new(gpu, curve, force_update, monitor_only, limits, fanflickerrange) {
-        Ok(m) => m,
-        Err(s) => {
-            error!("{}", s);
-            process::exit(1);
-        }
-    };
+    if gpu_count == 0 {
+        error!("No GPUs detected!");
+        process::exit(1);
+    }
 
-    info!("NVIDIA driver version: {}",
-          mgr.ctrl.get_version().unwrap());
-    let gpu_count = mgr.ctrl.gpu_count().unwrap();
+    let mut cards: Vec<NVFanManager> = (0u32..gpu_count)
+        .map(|gpu| make_gpu_manager(gpu, force_update, monitor_only, limits))
+        .collect();
+
     for i in 0u32..gpu_count {
         info!("NVIDIA graphics adapter #{}: {}", i,
-              mgr.ctrl.get_adapter(i).unwrap());
-        match mgr.ctrl.gpu_coolers(i) {
+              ctrl.get_adapter(i).unwrap());
+        match ctrl.gpu_coolers(i) {
             Ok(array) => {
                 info!("  GPU #{} coolers: {}", i,
                       array.iter()
@@ -712,10 +715,12 @@ pub fn main() {
 
     let json_output = matches.opt_present("j");
 
-    let data = Arc::new(RwLock::new(GPUData::new(&mgr, 0).unwrap()));
+    let mut data: Vec<_> = cards.iter()
+        .map(|mgr| Arc::new(RwLock::new(GPUData::new(&mgr, 0).unwrap())))
+        .collect();
 
     let server_port = if matches.opt_present("t") {
-        let srv_data = data.clone();
+        let srv_data = data[0].clone();
         let strport = format!("{}", DEFAULT_PORT);
         let port: u32 = match matches.opt_default("t", strport.as_str()) {
             Some(s) => {
@@ -745,27 +750,33 @@ pub fn main() {
             break;
         }
 
-        if let Err(e) = mgr.update() {
-            error!("Could not update fan speed: {}", e)
-        };
+        for gpu in 0u32..gpu_count {
 
-        let mut raw_data = data.write().unwrap();
-        let since_epoch: time::Duration =
+            let mgr = &mut cards[gpu as usize];
+            let data = &mut data[gpu as usize];
+
+            if let Err(e) = mgr.update() {
+                error!("[GPU {}] Could not update fan speed: {}", gpu, e)
+            };
+
+            let mut raw_data = data.write().unwrap();
+            let since_epoch: time::Duration =
                 time::OffsetDateTime::now() - time::OffsetDateTime::unix_epoch();
-        (*raw_data).update_from_mgr(since_epoch.whole_seconds(), &mgr, 0);
-        drop(raw_data);
+            (*raw_data).update_from_mgr(since_epoch.whole_seconds(), &mgr, gpu);
+            drop(raw_data);
 
-        let raw_data = data.read().unwrap();
-        debug!("Temp: {}; Speed: {:?} RPM ({:?}%); Load: {}%; Mode: {}",
-            raw_data.temp, raw_data.rpm, raw_data.speed, raw_data.load,
-            match raw_data.mode {
-                Some(NVCtrlFanControlState::Auto) => "Auto",
-                Some(NVCtrlFanControlState::Manual) => "Manual",
-                None => "ERR"
-            });
+            let raw_data = data.read().unwrap();
+            debug!("[GPU {}] Temp: {}; Speed: {:?} RPM ({:?}%); Load: {}%; Mode: {}",
+                   gpu, raw_data.temp, raw_data.rpm, raw_data.speed, raw_data.load,
+                   match raw_data.mode {
+                       Some(NVCtrlFanControlState::Auto) => "Auto",
+                       Some(NVCtrlFanControlState::Manual) => "Manual",
+                       None => "ERR"
+                   });
 
-        if json_output {
-            println!("{}", serde_json::to_string(&*raw_data).unwrap());
+            if json_output {
+                println!("{}", serde_json::to_string(&*raw_data).unwrap());
+            }
         }
 
         thread::sleep(timeout);
